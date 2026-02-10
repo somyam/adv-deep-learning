@@ -5,7 +5,9 @@ import torch
 from .bignet import BIGNET_DIM, LayerNorm  # noqa: F401
 
 
-def block_quantize_4bit(x: torch.Tensor, group_size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+def block_quantize_4bit(
+    x: torch.Tensor, group_size: int = 16
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize the input tensor to 4-bit precision along the last dimension.
     Always quantize group_size value together and store their absolute value first.
@@ -23,7 +25,9 @@ def block_quantize_4bit(x: torch.Tensor, group_size: int = 16) -> tuple[torch.Te
     return x_quant_4, normalization.to(torch.float16)
 
 
-def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) -> torch.Tensor:
+def block_dequantize_4bit(
+    x_quant_4: torch.Tensor, normalization: torch.Tensor
+) -> torch.Tensor:
     """
     The reverse operation of block_quantize_4bit.
     """
@@ -39,7 +43,13 @@ def block_dequantize_4bit(x_quant_4: torch.Tensor, normalization: torch.Tensor) 
 
 
 class Linear4Bit(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 16) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        group_size: int = 16,
+    ) -> None:
         super().__init__()
         # Let's store all the required information to load the weights from a checkpoint
         self._shape = (out_features, in_features)
@@ -51,38 +61,69 @@ class Linear4Bit(torch.nn.Module):
         # called "weight" that we need to quantize when the model is loaded.
         self.register_buffer(
             "weight_q4",
-            torch.zeros(out_features * in_features // group_size, group_size // 2, dtype=torch.int8),
+            torch.zeros(
+                out_features * in_features // group_size,
+                group_size // 2,
+                dtype=torch.int8,
+            ),
             persistent=False,
         )
         self.register_buffer(
             "weight_norm",
-            torch.zeros(out_features * in_features // group_size, 1, dtype=torch.float16),
+            torch.zeros(
+                out_features * in_features // group_size, 1, dtype=torch.float16
+            ),
             persistent=False,
         )
         # Register a hook to load the weights from a checkpoint. This function reaches deep into
         # PyTorch internals. It makes sure that Linear4Bit._load_state_dict_pre_hook is called
         # every time the model is loaded from a checkpoint. We will quantize the weights in that function.
-        self._register_load_state_dict_pre_hook(Linear4Bit._load_state_dict_pre_hook, with_module=True)
+        self._register_load_state_dict_pre_hook(
+            Linear4Bit._load_state_dict_pre_hook, with_module=True
+        )
         # Add in an optional bias
         self.bias = None
         if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=torch.float32))
+            self.bias = torch.nn.Parameter(
+                torch.zeros(out_features, dtype=torch.float32)
+            )
 
     def _load_state_dict_pre_hook(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
     ):
         if f"{prefix}weight" in state_dict:
             # Load the original weights and remove them from the state_dict (mark them as loaded)
-            weight = state_dict[f"{prefix}weight"]  # noqa: F841
+            weight = state_dict[f"{prefix}weight"]
             del state_dict[f"{prefix}weight"]
-            # TODO: Quantize the weights and store them in self.weight_q4 and self.weight_norm
-            raise NotImplementedError()
+
+            # Quantize the weights and store them in self.weight_q4 and self.weight_norm
+            # Flatten the weight matrix to 1D for quantization
+            weight_flat = weight.view(-1)
+
+            # Quantize using block quantization
+            weight_q4, weight_norm = block_quantize_4bit(weight_flat, self._group_size)
+
+            # Store the quantized weights in the buffers
+            self.weight_q4.copy_(weight_q4)
+            self.weight_norm.copy_(weight_norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            # TODO: Dequantize and call the layer
-            # Hint: You can use torch.nn.functional.linear
-            raise NotImplementedError()
+            # Dequantize the weights
+            weight_dequantized = block_dequantize_4bit(self.weight_q4, self.weight_norm)
+
+            # Reshape back to the original weight matrix shape
+            weight = weight_dequantized.view(self._shape)
+
+            # Perform the linear operation
+            return torch.nn.functional.linear(x, weight, self.bias)
 
 
 class BigNet4Bit(torch.nn.Module):
@@ -94,16 +135,35 @@ class BigNet4Bit(torch.nn.Module):
     class Block(torch.nn.Module):
         def __init__(self, channels):
             super().__init__()
-            # TODO: Implement me (feel free to copy and reuse code from bignet.py)
-            raise NotImplementedError()
+            # Use Linear4Bit instead of torch.nn.Linear
+            self.model = torch.nn.Sequential(
+                Linear4Bit(channels, channels),
+                torch.nn.ReLU(),
+                Linear4Bit(channels, channels),
+                torch.nn.ReLU(),
+                Linear4Bit(channels, channels),
+            )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.model(x) + x
 
     def __init__(self):
         super().__init__()
-        # TODO: Implement me (feel free to copy and reuse code from bignet.py)
-        raise NotImplementedError()
+        # Same structure as BigNet, but using 4-bit quantized linear layers
+        # LayerNorm stays in full precision
+        self.model = torch.nn.Sequential(
+            self.Block(BIGNET_DIM),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)

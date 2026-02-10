@@ -26,29 +26,68 @@ class LoRALinear(HalfLinear):
         """
         super().__init__(in_features, out_features, bias)
 
-        # TODO: Implement LoRA, initialize the layers, and make sure they are trainable
-        # Keep the LoRA layers in float32
-        raise NotImplementedError()
+        # LoRA low-rank decomposition: W' = W + A @ B
+        # A: [out_features, lora_dim], B: [lora_dim, in_features]
+        # Keep LoRA layers in float32 for better training
+        self.lora_a = torch.nn.Linear(in_features, lora_dim, bias=False)
+        self.lora_b = torch.nn.Linear(lora_dim, out_features, bias=False)
+
+        # Initialize LoRA weights
+        # Standard practice: Initialize A with small random values, B with zeros
+        # This ensures the initial LoRA contribution is zero (W + A@B = W initially)
+        torch.nn.init.kaiming_uniform_(self.lora_a.weight)
+        torch.nn.init.zeros_(self.lora_b.weight)
+
+        # Ensure LoRA layers are trainable (they should be by default, but being explicit)
+        self.lora_a.weight.requires_grad_(True)
+        self.lora_b.weight.requires_grad_(True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: Forward. Make sure to cast inputs to self.linear_dtype and the output back to x.dtype
-        raise NotImplementedError()
+        # Get the base linear layer output (from HalfLinear parent class)
+        # HalfLinear handles the float16 conversion internally and returns in x.dtype
+        base_output = super().forward(x)
+
+        # Compute LoRA adaptation in float32
+        # x is in original dtype (float32), LoRA layers are in float32
+        lora_output = self.lora_b(self.lora_a(x))
+
+        # Combine: output = base + LoRA (both in x.dtype)
+        return base_output + lora_output
 
 
 class LoraBigNet(torch.nn.Module):
     class Block(torch.nn.Module):
         def __init__(self, channels: int, lora_dim: int):
             super().__init__()
-            # TODO: Implement me (feel free to copy and reuse code from bignet.py)
-            raise NotImplementedError()
+            # Use LoRALinear instead of regular Linear layers
+            self.model = torch.nn.Sequential(
+                LoRALinear(channels, channels, lora_dim),
+                torch.nn.ReLU(),
+                LoRALinear(channels, channels, lora_dim),
+                torch.nn.ReLU(),
+                LoRALinear(channels, channels, lora_dim),
+            )
 
         def forward(self, x: torch.Tensor):
             return self.model(x) + x
 
     def __init__(self, lora_dim: int = 32):
         super().__init__()
-        # TODO: Implement me (feel free to copy and reuse code from bignet.py)
-        raise NotImplementedError()
+        # Same structure as BigNet, but using LoRA-enabled blocks
+        # LayerNorm stays in full precision
+        self.model = torch.nn.Sequential(
+            self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM, lora_dim),
+            LayerNorm(BIGNET_DIM),
+            self.Block(BIGNET_DIM, lora_dim),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
